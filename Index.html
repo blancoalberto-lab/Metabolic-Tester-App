@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metabolic Kinetics & Steady-State Validator</title>
+    
+    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css">
+    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f4f6f8; color: #343a40; padding: 20px; }
+        .container-custom { max-width: 1500px; margin: auto; }
+        .header-card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; border-top: 5px solid #0d6efd; text-align: center; }
+        h1 { color: #0d6efd; font-weight: 800; margin-bottom: 5px; }
+        .controls { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); display: flex; gap: 20px; align-items: center; flex-wrap: wrap; justify-content: center; }
+        .chart-card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; overflow-x: auto; }
+        #loader { display: none; font-weight: bold; color: #0d6efd; margin-left: 15px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 0.85em; }
+        th, td { border: 1px solid #dee2e6; padding: 8px; text-align: center; }
+        th { background-color: #f8f9fa; font-weight: bold; color: #495057; font-size: 0.9em; }
+        tr:hover { background-color: #f1f3f5; }
+        .warning { color: #dc3545; font-weight: bold; }
+        .summary-card { background: #fff3cd; border-top: 5px solid #ffc107; }
+        .alert-box { background: #e2e3e5; color: #41464b; padding: 15px; border-radius: 8px; border-left: 5px solid #dc3545; margin-bottom: 20px; font-size: 0.9em; }
+    </style>
+
+    <py-config>
+        packages = ["pandas", "numpy", "scipy", "matplotlib", "seaborn"]
+    </py-config>
+</head>
+<body>
+
+<div class="container-custom">
+    <div class="header-card">
+        <h1>Metabolic Kinetics & Steady-State Validator</h1>
+    </div>
+
+    <div class="controls">
+        <div>
+            <label for="csv_files" class="form-label" style="font-weight:bold; font-size: 0.85em;">Select CPET Files (CSV):</label>
+            <input type="file" id="csv_files" class="form-control" accept=".csv" multiple style="max-width: 300px;">
+        </div>
+        <div>
+            <label for="stage_duration" class="form-label" style="font-weight:bold; font-size: 0.85em;">Stage Duration (seconds):</label>
+            <input type="number" id="stage_duration" class="form-control" value="180" style="max-width: 150px;">
+        </div>
+        <div style="align-self: flex-end;">
+            <button id="run_btn" class="btn btn-primary" style="background-color: #0d6efd; border-color: #0d6efd;">Analyze Cohort</button>
+            <span id="loader">Computing Kinetics & Models...</span>
+        </div>
+    </div>
+
+    <div id="global_summary_container"></div>
+    <div id="results_container"></div>
+</div>
+
+<script type="py">
+import js
+from pyodide.ffi import create_proxy
+import pandas as pd
+import numpy as np
+import warnings
+from scipy.optimize import curve_fit, OptimizeWarning
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
+import base64
+
+plt.style.use('default')
+sns.set_theme(style="whitegrid")
+warnings.simplefilter("ignore", OptimizeWarning)
+warnings.filterwarnings("ignore")
+
+def clean_cols(df):
+    new_cols = [str(c).replace('"', '').replace("'", '').strip() for c in df.columns]
+    df.columns = new_cols
+    col_map = {}
+    for c in df.columns:
+        c_upper = c.upper()
+        if 'VO2' in c_upper and 'KG' not in c_upper and 'VE' not in c_upper and 'VO2' not in col_map.values(): col_map[c] = 'VO2'
+        elif 'VCO2' in c_upper and 'VE' not in c_upper and 'VCO2' not in col_map.values(): col_map[c] = 'VCO2'
+        elif 'RER' in c_upper and 'RER' not in col_map.values(): col_map[c] = 'RER'
+        elif 'TIME' in c_upper and 'TIME' not in col_map.values(): col_map[c] = 'TIME'
+        elif 'HR' in c_upper and 'FATMAX' not in c_upper and 'HR' not in col_map.values(): col_map[c] = 'HR'
+        elif ('TM' in c_upper or 'SPEED' in c_upper) and 'Speed_mph' not in col_map.values(): col_map[c] = 'Speed_mph'
+        elif (('LEAN' in c_upper and 'MASS' in c_upper) or c_upper == 'LM') and 'LeanMass' not in col_map.values(): col_map[c] = 'LeanMass'
+    df.rename(columns=col_map, inplace=True)
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+def fat_cho_jeukendrup(vo2_l, vco2_l):
+    fat = (1.695 * vo2_l) - (1.701 * vco2_l)
+    cho = (4.210 * vco2_l) - (2.962 * vo2_l)
+    return max(0, fat), max(0, cho)
+
+def relative_energy(rer):
+    rer_clamped = min(max(rer, 0.71), 1.0)
+    cho_pct = ((rer_clamped - 0.71) / (1.0 - 0.71)) * 100
+    return 100 - cho_pct, cho_pct
+
+def impute_outliers_hampel(series, window_size=7, n_sigmas=2.5):
+    s = series.copy()
+    rolling_median = s.rolling(window=window_size, center=True).median().bfill().ffill()
+    rolling_mad = (s - rolling_median).abs().rolling(window=window_size, center=True).median().bfill().ffill()
+    threshold = np.maximum(n_sigmas * 1.4826 * rolling_mad, 0.02 * rolling_median.abs())
+    outliers = (s - rolling_median).abs() > threshold
+    if outliers.any():
+        s.loc[outliers] = np.nan
+        s = s.interpolate(method='linear', limit_direction='both')
+    s = s.rolling(window=5, center=True, min_periods=1).mean()
+    return s, outliers.sum()
+
+def exp_kinetics(t, A_fast, tau_fast, A_slow):
+    return A_fast * (1 - np.exp(-t / tau_fast)) + (A_slow * t)
+
+def lin_kinetics(t, m, c):
+    return m * t + c
+
+def calc_aic(y_true, y_pred, k):
+    n = len(y_true)
+    rss = np.sum((y_true - y_pred)**2)
+    if rss <= 0: return -np.inf
+    return n * np.log(rss/n) + 2 * k
+
+def calc_r2(y_true, y_pred):
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    ss_res = np.sum((y_true - y_pred)**2)
+    return max(0.0, 1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+
+def parabola_fat(x, a, b, c):
+    return a*x**2 + b*x + c
+
+def build_plot_html(fig, filename):
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=120)
+    b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    plt.close(fig)
+    return f"<div style='text-align: right; margin-bottom: 5px;'><a href='data:image/png;base64,{b64}' download='{filename}.png' class='btn btn-sm btn-outline-secondary' style='font-size: 0.75em;'>📸 Download</a></div><img src='data:image/png;base64,{b64}' style='width:100%; border-radius:8px; border: 1px solid #dee2e6;'>"
+
+async def process_data(event):
+    js.document.getElementById("loader").style.display = "inline-block"
+    js.document.getElementById("results_container").innerHTML = ""
+    js.document.getElementById("global_summary_container").innerHTML = ""
+    
+    file_input = js.document.getElementById("csv_files")
+    stage_dur = float(js.document.getElementById("stage_duration").value)
+    
+    if not file_input.files.length:
+        js.window.alert("Please select at least one CPET CSV file.")
+        js.document.getElementById("loader").style.display = "none"
+        return
+
+    global_summary_data = []
+
+    try:
+        html_out = ""
+        for i in range(file_input.files.length):
+            file = file_input.files.item(i)
+            text = await file.text()
+            df = pd.read_csv(io.StringIO(text))
+            df = clean_cols(df)
+            
+            lean_mass = np.nan
+            if 'LeanMass' in df.columns:
+                lm_series = pd.to_numeric(df['LeanMass'], errors='coerce').dropna()
+                if not lm_series.empty:
+                    lean_mass = float(lm_series.iloc[0])
+
+            if 'Speed_mph' in df.columns:
+                df['Speed_kmh'] = pd.to_numeric(df['Speed_mph'], errors='coerce') * 1.60934
+            else:
+                df['Speed_kmh'] = np.nan
+                
+            req_cols = ['TIME', 'VO2', 'VCO2', 'RER']
+            missing = [c for c in req_cols if c not in df.columns]
+            if missing:
+                html_out += f"<div class='alert-box'><b>{file.name}:</b> Missing columns: {missing}</div>"
+                continue
+
+            for c in req_cols + ['HR', 'Speed_kmh']: 
+                if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
+                
+            df = df.dropna(subset=req_cols)
+            vo2_max_overall = df['VO2'].max()
+
+            for col in ['VO2', 'VCO2', 'RER', 'HR']:
+                if col in df.columns:
+                    df[col], _ = impute_outliers_hampel(df[col])
+            
+            df['RER_High'] = df['RER'] >= 1.0
+            df['Consecutive_High'] = df['RER_High'].groupby((~df['RER_High']).cumsum()).cumsum()
+            stop_idx = df.index[df['Consecutive_High'] >= 6].min()
+            df_valid = df.loc[:stop_idx].copy() if pd.notna(stop_idx) else df.copy()
+
+            df_valid['Stage'] = (df_valid['TIME'] // stage_dur) + 1
+            stages = df_valid['Stage'].unique()
+            
+            stage_results = []
+            kinetic_data = []
+            
+            prev_baseline_vo2 = df_valid['VO2'].iloc[0] if len(df_valid) > 0 else 0
+            prev_baseline_vco2 = df_valid['VCO2'].iloc[0] if len(df_valid) > 0 else 0
+
+            for s in stages:
+                stage_data = df_valid[df_valid['Stage'] == s].copy()
+                if len(stage_data) < 6: continue 
+                
+                max_t = stage_data['TIME'].max()
+                is_window = stage_data['TIME'] >= (max_t - 60)
+                last_60 = stage_data[is_window]
+                
+                if len(last_60) > 0:
+                    avg_vo2 = last_60['VO2'].mean()
+                    avg_vco2 = last_60['VCO2'].mean()
+                    avg_rer = last_60['RER'].mean()
+                    cv_rer = (last_60['RER'].std() / avg_rer) * 100 if avg_rer > 0 else 0
+                    avg_hr = last_60['HR'].mean() if 'HR' in last_60.columns else np.nan
+                    avg_speed = last_60['Speed_kmh'].mean() if 'Speed_kmh' in last_60.columns else np.nan
+                    pct_vo2max = (avg_vo2 / vo2_max_overall) * 100 if vo2_max_overall > 0 else np.nan
+                    fat_g, cho_g = fat_cho_jeukendrup(avg_vo2, avg_vco2)
+                    fat_pct, cho_pct = relative_energy(avg_rer)
+
+                if s > stages.min():
+                    prev_stage = df_valid[df_valid['Stage'] == s - 1]
+                    if not prev_stage.empty:
+                        last_30 = prev_stage[prev_stage['TIME'] >= (prev_stage['TIME'].max() - 30)]
+                        if len(last_30) > 0:
+                            prev_baseline_vo2 = last_30['VO2'].mean()
+                            prev_baseline_vco2 = last_30['VCO2'].mean()
+
+                t_rel = stage_data['TIME'] - stage_data['TIME'].min()
+                y_vo2_ml = (stage_data['VO2'] - prev_baseline_vo2) * 1000
+                
+                bounds_exp = ([0.0, 5.0, -100.0], [np.inf, 150.0, 100.0])
+                initial_A = max(10, y_vo2_ml.max() - y_vo2_ml.min())
+                
+                best_model_vo2 = "None"
+                v_fast, v_slow = np.nan, np.nan
+                r2_vo2 = 0.0
+                
+                try:
+                    popt_exp_vo2, _ = curve_fit(exp_kinetics, t_rel, y_vo2_ml, p0=[initial_A, 30, 0], bounds=bounds_exp, maxfev=2000)
+                    fit_exp_vo2 = exp_kinetics(t_rel, *popt_exp_vo2)
+                    aic_exp_vo2 = calc_aic(y_vo2_ml, fit_exp_vo2, 3)
+                    r2_exp_vo2 = calc_r2(y_vo2_ml, fit_exp_vo2)
+                    
+                    popt_lin_vo2, _ = curve_fit(lin_kinetics, t_rel, y_vo2_ml, maxfev=2000)
+                    fit_lin_vo2 = lin_kinetics(t_rel, *popt_lin_vo2)
+                    aic_lin_vo2 = calc_aic(y_vo2_ml, fit_lin_vo2, 2)
+                    r2_lin_vo2 = calc_r2(y_vo2_ml, fit_lin_vo2)
+                    
+                    if aic_lin_vo2 < aic_exp_vo2:
+                        fit_vo2_ml = fit_lin_vo2
+                        best_model_vo2 = "Linear"
+                        v_fast, v_slow = 0.0, popt_lin_vo2[0]
+                        r2_vo2 = r2_lin_vo2
+                    else:
+                        fit_vo2_ml = fit_exp_vo2
+                        best_model_vo2 = "Exponential"
+                        v_fast, v_slow = popt_exp_vo2[0], popt_exp_vo2[2]
+                        r2_vo2 = r2_exp_vo2
+                except:
+                    fit_vo2_ml = np.full(len(t_rel), np.nan)
+                    r2_vo2 = np.nan
+
+                stage_results.append({
+                    'Stage': s, 'Time_End': max_t, 'Speed_kmh': avg_speed, 'HR': avg_hr, '%VO2max': pct_vo2max,
+                    'RER_CV': cv_rer, 'Avg_RER': avg_rer, 'VO2': avg_vo2, 'VCO2': avg_vco2, 
+                    'FAT_g_min': fat_g, 'CHO_g_min': cho_g, 'FAT_pct': fat_pct, 'CHO_pct': cho_pct,
+                    'VO2_Model': best_model_vo2, 'VO2_R2': r2_vo2, 'VO2_Fast_ml': v_fast, 'VO2_Slow_ml_s': v_slow
+                })
+
+                kinetic_data.append({
+                    'Stage': s, 'time_abs': stage_data['TIME'], 
+                    't_normal': stage_data.loc[~is_window, 'TIME'],
+                    'vo2_normal': stage_data.loc[~is_window, 'VO2'] * 1000,
+                    't_window': stage_data.loc[is_window, 'TIME'],
+                    'vo2_window': stage_data.loc[is_window, 'VO2'] * 1000,
+                    'vo2_fit_ml': (prev_baseline_vo2 * 1000) + fit_vo2_ml
+                })
+
+            res_df = pd.DataFrame(stage_results)
+            if len(res_df) < 3:
+                html_out += f"<div class='alert-box'><b>{file.name}:</b> Not enough valid stages to build a polynomial model.</div>"
+                continue
+
+            try:
+                popt_fat, _ = curve_fit(parabola_fat, res_df['Stage'], res_df['FAT_g_min'], bounds=([-np.inf, -np.inf, -np.inf], [-1e-6, np.inf, np.inf]))
+                a, b, c = popt_fat
+            except:
+                a, b, c = np.polyfit(res_df['Stage'], res_df['FAT_g_min'], 2)
+                
+            poly_func = np.poly1d([a, b, c])
+            r2_fat = calc_r2(res_df['FAT_g_min'], poly_func(res_df['Stage']))
+            
+            fatmax_stage_exact = -b / (2*a) if a < 0 else res_df['Stage'].iloc[res_df['FAT_g_min'].argmax()]
+            mfo = poly_func(fatmax_stage_exact)
+            
+            mfo_adj_ffm = np.nan
+            if pd.notna(lean_mass) and lean_mass > 0:
+                mfo_adj_ffm = (mfo / lean_mass) * 1000
+
+            fatmax_pct_vo2peak = np.interp(fatmax_stage_exact, res_df['Stage'], res_df['%VO2max'])
+            m_fat, b_fat = np.polyfit(res_df['Stage'], res_df['FAT_pct'], 1)
+            m_cho, b_cho = np.polyfit(res_df['Stage'], res_df['CHO_pct'], 1)
+            crossover_stage = (b_cho - b_fat) / (m_fat - m_cho)
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            
+            axes[0].grid(True, alpha=0.25)
+            axes[1].grid(True, alpha=0.25)
+            axes[0].set_axisbelow(True)
+            axes[1].set_axisbelow(True)
+            
+            x_range = np.linspace(res_df['Stage'].min(), res_df['Stage'].max(), 100)
+            axes[0].scatter(res_df['Stage'], res_df['FAT_g_min'], color='black')
+            axes[0].plot(x_range, poly_func(x_range), color='#0d6efd')
+            axes[0].axvline(fatmax_stage_exact, color='green', linestyle='--', zorder=1)
+            
+            if pd.notna(mfo_adj_ffm):
+                label_txt = f'MFO$_{{adjFFM}}$: {mfo_adj_ffm:.2f} mg$\\cdot$kgFFM$^{{-1}}\\cdot$min$^{{-1}}$\nSpeed at FatMax\n({fatmax_pct_vo2peak:.0f}% V̇O₂peak)'
+            else:
+                label_txt = f'Speed at FatMax\n({fatmax_pct_vo2peak:.0f}% V̇O₂peak)'
+                
+            axes[0].text(fatmax_stage_exact, 0.05, label_txt, 
+                         color='green', rotation=0, transform=axes[0].get_xaxis_transform(),
+                         va='bottom', ha='center', fontweight='bold', fontsize=9,
+                         bbox=dict(facecolor='white', alpha=0.85, edgecolor='none', pad=3), zorder=4)
+            
+            axes[0].set_title("MFO and FatMax")
+            axes[0].set_xlabel("Stage")
+            axes[0].set_ylabel("Fat Ox (g/min)")
+
+            prev_t = None
+            prev_y = None
+            first_legend_entry = True
+            
+            for k in kinetic_data:
+                axes[1].scatter(k['t_normal'], k['vo2_normal'], color='#b2b2b2', alpha=0.65, s=15, zorder=2)
+                
+                if first_legend_entry:
+                    axes[1].scatter(k['t_window'], k['vo2_window'], color='#0d6efd', alpha=0.35, s=15, zorder=2.5, label='Gas-exchange window used for FatOx calculation')
+                    first_legend_entry = False
+                else:
+                    axes[1].scatter(k['t_window'], k['vo2_window'], color='#0d6efd', alpha=0.35, s=15, zorder=2.5)
+                
+                t_list = list(k['time_abs'])
+                y_list = list(k['vo2_fit_ml'])
+                
+                if len(t_list) > 0:
+                    axes[1].plot(t_list, y_list, color='darkred', linewidth=1.5, zorder=3)
+                    if prev_t is not None:
+                        axes[1].plot([prev_t, t_list[0]], [prev_y, y_list[0]], color='darkred', linestyle='--', alpha=0.4, linewidth=1.2, zorder=3)
+                        
+                    prev_t = t_list[-1]
+                    prev_y = y_list[-1]
+
+            max_t_plot = df_valid['TIME'].max()
+            for sl in np.arange(stage_dur, max_t_plot, stage_dur):
+                axes[1].axvline(sl, color='#343a40', linestyle='-', alpha=0.6, linewidth=1.2, zorder=1)
+
+            idx_fatmax = (np.abs(res_df['Stage'] - fatmax_stage_exact)).idxmin()
+            idx_cross = (np.abs(res_df['Stage'] - crossover_stage)).idxmin()
+            closest_stage_fm = res_df.iloc[idx_fatmax]['Stage']
+            
+            y_min, y_max = axes[1].get_ylim()
+            axes[1].set_ylim(y_min, y_max + (y_max - y_min) * 0.18)
+            y_min, y_max = axes[1].get_ylim()
+            
+            for _, r_stg in res_df.iterrows():
+                stg_num = r_stg['Stage']
+                if stg_num == closest_stage_fm: continue
+                    
+                stg_rer_cv = r_stg['RER_CV']
+                stg_end = stg_num * stage_dur
+                stg_start = stg_end - stage_dur
+                
+                offset = 0.04 if stg_num % 2 == 0 else 0.12
+                text_y = y_max - (y_max - y_min) * offset
+                txt_color = '#dc3545' if stg_rer_cv > 5 else '#495057'
+                
+                axes[1].text(stg_start + (stage_dur/2), text_y, f'RER-CV:\n{stg_rer_cv:.1f}%', 
+                             ha='center', va='top', fontsize=7.5, color=txt_color, zorder=4,
+                             bbox=dict(facecolor='white', alpha=0.85, edgecolor='#dee2e6', boxstyle='round,pad=0.3'))
+            
+            end_shade = closest_stage_fm * stage_dur
+            start_shade = end_shade - 60
+            rer_cv_fatmax = res_df.iloc[idx_fatmax]['RER_CV']
+            
+            if rer_cv_fatmax > 5.0:
+                shade_color = '#dc3545'  
+                text_color = '#721c24'   
+            else:
+                shade_color = '#28a745'  
+                text_color = '#155724'   
+
+            axes[1].axvspan(start_shade, end_shade, color=shade_color, alpha=0.15, zorder=0)
+            text_y_fm = y_max - (y_max - y_min) * 0.06
+            
+            vo2_model_fm = res_df.iloc[idx_fatmax]['VO2_Model']
+            model_display_name = "Mono-exponential" if vo2_model_fm == "Exponential" else "Linear"
+            r2_vo2_fm = res_df.iloc[idx_fatmax]['VO2_R2']
+            
+            axes[1].text(start_shade + 30, text_y_fm, 
+                         f'Speed at FatMax\nRER-CV: {rer_cv_fatmax:.1f}%\n{model_display_name} Fit (R²: {r2_vo2_fm:.2f})', 
+                         ha='center', va='top', fontsize=8.5, fontweight='bold', color=text_color,
+                         bbox=dict(facecolor='white', alpha=0.9, edgecolor='none', pad=2), zorder=5)
+
+            axes[1].set_title("V̇O₂ Kinetics")
+            axes[1].set_xlabel("Absolute Time (sec)")
+            axes[1].set_ylabel("V̇O₂ (ml/min)")
+            axes[1].legend(loc='lower right', frameon=True, facecolor='white', framealpha=0.9)
+
+            plt.tight_layout()
+            plots_html = build_plot_html(fig, filename=f"{file.name.split('.')[0]}_Plots")
+            
+            b64_csv = base64.b64encode(res_df.to_csv(index=False).encode('utf-8')).decode()
+            dl_csv = f"<div style='text-align:right; margin-bottom: 10px;'><a href='data:text/csv;base64,{b64_csv}' download='{file.name.split('.')[0]}_Results.csv' class='btn btn-success btn-sm'>💾 Download File Table (CSV)</a></div>"
+            
+            table_html = f"<h3 style='color: #495057; margin-top:20px; border-bottom: 2px solid #dee2e6; padding-bottom:10px;'>File: {file.name}</h3>"
+            
+            mfo_adj_str = f" | <b>MFOadjFFM:</b> {mfo_adj_ffm:.2f} mg·kgFFM⁻¹·min⁻¹" if pd.notna(mfo_adj_ffm) else ""
+            table_html += f"<p style='font-size:1.1em;'><b>Modeled MFO:</b> {mfo:.2f} g/min{mfo_adj_str} | <b>FatOx Fit R²:</b> {r2_fat:.3f} | <b>FatMax (Stage):</b> {fatmax_stage_exact:.2f} | <b>Crossover (Stage):</b> {crossover_stage:.2f}</p>"
+            table_html += dl_csv
+            
+            table_html += "<table><thead><tr><th>Stage</th><th>Speed (kmh)</th><th>% V̇O₂max</th><th>HR</th><th>RER CV%</th><th>FAT (g)</th><th>% Fat En</th><th>V̇O₂ Model</th><th>R² Fit</th><th>V̇O₂ Fast (ml/min)</th><th>V̇O₂ Slow (ml/min/s)</th></tr></thead><tbody>"
+            
+            for i, r in res_df.iterrows():
+                cv_cls = "warning" if r['RER_CV'] > 5 else ""
+                cv_text = f"<span class='{cv_cls}'>{r['RER_CV']:.2f}%</span>"
+                
+                is_fatmax = (i == idx_fatmax)
+                is_cross = (i == idx_cross)
+                
+                row_style = ""
+                stage_lbl = f"{r['Stage']}"
+                
+                if is_fatmax and is_cross:
+                    row_style = "background-color: #d1ecf1;"
+                    stage_lbl += "<br><i>(≈FatMax & Crossover)</i>"
+                elif is_fatmax:
+                    row_style = "background-color: #d4edda;"
+                    stage_lbl += "<br><i>(≈FatMax)</i>"
+                elif is_cross:
+                    row_style = "background-color: #fff3cd;"
+                    stage_lbl += "<br><i>(≈Crossover)</i>"
+
+                table_html += f"<tr style='{row_style}'><td>{stage_lbl}</td><td>{r['Speed_kmh']:.1f}</td><td>{r['%VO2max']:.1f}%</td><td>{r['HR']:.0f}</td><td>{cv_text}</td><td>{r['FAT_g_min']:.2f}</td><td>{r['FAT_pct']:.1f}%</td><td>{r['VO2_Model']}</td><td>{r['VO2_R2']:.3f}</td><td>{r['VO2_Fast_ml']:.1f}</td><td>{r['VO2_Slow_ml_s']:.3f}</td></tr>"
+            table_html += "</tbody></table>"
+
+            html_out += f"<div class='chart-card'>{table_html}<div style='display:block; margin-top:20px;'>{plots_html}</div></div>"
+
+            fatmax_row = res_df.iloc[idx_fatmax]
+            cross_row = res_df.iloc[idx_cross]
+            
+            global_summary_data.append({
+                'Filename': file.name,
+                'LeanMass_kg': lean_mass,
+                'Modeled_MFO_g_min': mfo,
+                'MFOadjFFM': mfo_adj_ffm,
+                'FatOx_R2': r2_fat,
+                'Modeled_FatMax_Stage': fatmax_stage_exact,
+                'FatMax_Closest_Stage': fatmax_row['Stage'],
+                'FatMax_Speed_kmh': fatmax_row['Speed_kmh'],
+                'FatMax_%VO2max': fatmax_row['%VO2max'],
+                'FatMax_HR': fatmax_row['HR'],
+                'FatMax_RER_CV': fatmax_row['RER_CV'],
+                'Modeled_Crossover_Stage': crossover_stage,
+                'Cross_Closest_Stage': cross_row['Stage'],
+                'Cross_Speed_kmh': cross_row['Speed_kmh'],
+                'Cross_%VO2max': cross_row['%VO2max'],
+                'Cross_HR': cross_row['HR'],
+                'Cross_RER_CV': cross_row['RER_CV']
+            })
+
+        if len(global_summary_data) > 0:
+            sum_df = pd.DataFrame(global_summary_data)
+            b64_sum_csv = base64.b64encode(sum_df.to_csv(index=False).encode('utf-8')).decode()
+            sum_html = f"<div class='chart-card summary-card'><h3>📊 Global Cohort Summary</h3>"
+            sum_html += f"<div style='text-align:right; margin-bottom: 10px;'><a href='data:text/csv;base64,{b64_sum_csv}' download='NexPhy_Cohort_Summary.csv' class='btn btn-dark btn-sm'>📥 Download Cohort Summary (CSV)</a></div>"
+            
+            has_lm = not sum_df['LeanMass_kg'].isna().all()
+            
+            sum_html += "<table><thead><tr><th>Subject File</th><th>MFO (g/min)</th>"
+            if has_lm:
+                sum_html += "<th>MFOadjFFM<br>(mg·kgFFM⁻¹·min⁻¹)</th>"
+            sum_html += "<th>FatOx R²</th><th>FatMax Speed</th><th>FatMax % V̇O₂max</th><th>FatMax HR</th><th>FatMax RER CV%</th><th>Cross Speed</th><th>Cross % V̇O₂max</th><th>Cross HR</th><th>Cross RER CV%</th></tr></thead><tbody>"
+            
+            for _, r in sum_df.iterrows():
+                fm_warn = "⚠️ " if r['FatMax_RER_CV'] > 5 else ""
+                cr_warn = "⚠️ " if r['Cross_RER_CV'] > 5 else ""
+                
+                sum_html += f"<tr><td>{r['Filename']}</td><td>{r['Modeled_MFO_g_min']:.2f}</td>"
+                if has_lm:
+                    lm_val = f"{r['MFOadjFFM']:.2f}" if pd.notna(r['MFOadjFFM']) else "N/A"
+                    sum_html += f"<td>{lm_val}</td>"
+                sum_html += f"<td>{r['FatOx_R2']:.3f}</td><td>{r['FatMax_Speed_kmh']:.1f}</td><td>{r['FatMax_%VO2max']:.1f}%</td><td>{r['FatMax_HR']:.0f}</td><td>{fm_warn}{r['FatMax_RER_CV']:.1f}%</td><td>{r['Cross_Speed_kmh']:.1f}</td><td>{r['Cross_%VO2max']:.1f}%</td><td>{r['Cross_HR']:.0f}</td><td>{cr_warn}{r['Cross_RER_CV']:.1f}%</td></tr>"
+            sum_html += "</tbody></table></div>"
+            
+            js.document.getElementById("global_summary_container").innerHTML = sum_html
+
+        js.document.getElementById("results_container").innerHTML = html_out
+        js.document.getElementById("loader").style.display = "none"
+
+    except Exception as e:
+        js.document.getElementById("loader").style.display = "none"
+        js.window.alert(f"An error occurred:\n\n{str(e)}")
+
+js.document.getElementById("run_btn").addEventListener("click", create_proxy(process_data))
+</script>
+
+</body>
+</html>
