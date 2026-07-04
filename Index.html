@@ -99,16 +99,15 @@ def relative_energy(rer):
     cho_pct = ((rer_clamped - 0.71) / (1.0 - 0.71)) * 100
     return 100 - cho_pct, cho_pct
 
-def impute_outliers_hampel(series, window_size=7, n_sigmas=2.5):
+def impute_outliers_hampel(series, window_size=5, n_sigmas=3):
     s = series.copy()
     rolling_median = s.rolling(window=window_size, center=True).median().bfill().ffill()
     rolling_mad = (s - rolling_median).abs().rolling(window=window_size, center=True).median().bfill().ffill()
-    threshold = np.maximum(n_sigmas * 1.4826 * rolling_mad, 0.02 * rolling_median.abs())
+    threshold = np.maximum(n_sigmas * 1.4826 * rolling_mad, 0.05 * rolling_median.abs())
     outliers = (s - rolling_median).abs() > threshold
     if outliers.any():
         s.loc[outliers] = np.nan
         s = s.interpolate(method='linear', limit_direction='both')
-    s = s.rolling(window=5, center=True, min_periods=1).mean()
     return s, outliers.sum()
 
 def exp_kinetics(t, A_fast, tau_fast, A_slow):
@@ -233,22 +232,23 @@ async def process_data(event):
                 y_vo2_ml = (stage_data['VO2'] - prev_baseline_vo2) * 1000
                 
                 bounds_exp = ([0.0, 5.0, -100.0], [np.inf, 150.0, 100.0])
-                initial_A = max(10, y_vo2_ml.max() - y_vo2_ml.min())
+                y_vo2_ml_kinetics = pd.Series(y_vo2_ml).rolling(window=5, center=True, min_periods=1).mean().values
+                initial_A = max(10, y_vo2_ml_kinetics.max() - y_vo2_ml_kinetics.min())
                 
                 best_model_vo2 = "None"
                 v_fast, v_slow = np.nan, np.nan
                 r2_vo2 = 0.0
                 
                 try:
-                    popt_exp_vo2, _ = curve_fit(exp_kinetics, t_rel, y_vo2_ml, p0=[initial_A, 30, 0], bounds=bounds_exp, maxfev=2000)
+                    popt_exp_vo2, _ = curve_fit(exp_kinetics, t_rel, y_vo2_ml_kinetics, p0=[initial_A, 30, 0], bounds=bounds_exp, maxfev=2000)
                     fit_exp_vo2 = exp_kinetics(t_rel, *popt_exp_vo2)
-                    aic_exp_vo2 = calc_aic(y_vo2_ml, fit_exp_vo2, 3)
-                    r2_exp_vo2 = calc_r2(y_vo2_ml, fit_exp_vo2)
+                    aic_exp_vo2 = calc_aic(y_vo2_ml_kinetics, fit_exp_vo2, 3)
+                    r2_exp_vo2 = calc_r2(y_vo2_ml_kinetics, fit_exp_vo2)
                     
-                    popt_lin_vo2, _ = curve_fit(lin_kinetics, t_rel, y_vo2_ml, maxfev=2000)
+                    popt_lin_vo2, _ = curve_fit(lin_kinetics, t_rel, y_vo2_ml_kinetics, maxfev=2000)
                     fit_lin_vo2 = lin_kinetics(t_rel, *popt_lin_vo2)
-                    aic_lin_vo2 = calc_aic(y_vo2_ml, fit_lin_vo2, 2)
-                    r2_lin_vo2 = calc_r2(y_vo2_ml, fit_lin_vo2)
+                    aic_lin_vo2 = calc_aic(y_vo2_ml_kinetics, fit_lin_vo2, 2)
+                    r2_lin_vo2 = calc_r2(y_vo2_ml_kinetics, fit_lin_vo2)
                     
                     if aic_lin_vo2 < aic_exp_vo2:
                         fit_vo2_ml = fit_lin_vo2
